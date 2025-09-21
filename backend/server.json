@@ -1,0 +1,181 @@
+import express from "express";
+import mongoose from "mongoose";
+import cors from "cors";
+import dotenv from "dotenv";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import multer from "multer";
+import cloudinary from "cloudinary";
+import nodemailer from "nodemailer";
+import { createServer } from "http";
+import { Server } from "socket.io";
+
+dotenv.config();
+const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, { cors: { origin: "*" } });
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// MongoDB connect
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+}).then(() => console.log("✅ MongoDB Connected"))
+  .catch(err => console.error("❌ MongoDB Error:", err));
+
+// Cloudinary config
+cloudinary.v2.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// Storage for multer (temporary before upload to Cloudinary)
+const storage = multer.diskStorage({});
+const upload = multer({ storage });
+
+// -------------------- MODELS --------------------
+const userSchema = new mongoose.Schema({
+  name: String,
+  email: { type: String, unique: true },
+  password: String,
+  age: Number,
+  gender: String,
+  bio: String,
+  profilePhoto: String
+});
+const User = mongoose.model("User", userSchema);
+
+const postSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  text: String,
+  photo: String,
+  createdAt: { type: Date, default: Date.now }
+});
+const Post = mongoose.model("Post", postSchema);
+
+const messageSchema = new mongoose.Schema({
+  sender: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  receiver: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  text: String,
+  photo: String,
+  createdAt: { type: Date, default: Date.now }
+});
+const Message = mongoose.model("Message", messageSchema);
+
+// -------------------- AUTH --------------------
+app.post("/api/register", async (req, res) => {
+  try {
+    const { name, email, password, age, gender, bio } = req.body;
+    const hashed = await bcrypt.hash(password, 10);
+    const user = new User({ name, email, password: hashed, age, gender, bio });
+    await user.save();
+    res.json({ message: "User registered", user });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post("/api/login", async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  if (!user) return res.status(400).json({ error: "User not found" });
+
+  const match = await bcrypt.compare(password, user.password);
+  if (!match) return res.status(400).json({ error: "Invalid password" });
+
+  const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "7d" });
+  res.json({ token, user });
+});
+
+// -------------------- PROFILE PHOTO --------------------
+app.post("/api/uploadProfilePhoto", upload.single("photo"), async (req, res) => {
+  try {
+    const result = await cloudinary.v2.uploader.upload(req.file.path);
+    const user = await User.findByIdAndUpdate(req.body.userId, { profilePhoto: result.secure_url }, { new: true });
+    res.json(user);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// -------------------- POSTS --------------------
+app.post("/api/createPost", upload.single("photo"), async (req, res) => {
+  try {
+    let photoUrl = "";
+    if (req.file) {
+      const result = await cloudinary.v2.uploader.upload(req.file.path);
+      photoUrl = result.secure_url;
+    }
+    const post = new Post({ user: req.body.userId, text: req.body.text, photo: photoUrl });
+    await post.save();
+    res.json(post);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get("/api/posts", async (req, res) => {
+  const posts = await Post.find().populate("user", "name profilePhoto");
+  res.json(posts);
+});
+
+// -------------------- FORGOT PASSWORD --------------------
+app.post("/api/forgotPassword", async (req, res) => {
+  const { email } = req.body;
+  const user = await User.findOne({ email });
+  if (!user) return res.status(400).json({ error: "No user with that email" });
+
+  const resetToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "15m" });
+  const resetUrl = `${process.env.FRONTEND_URL}/reset.html?token=${resetToken}`;
+
+  // Send email
+  const transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_HOST,
+    port: process.env.EMAIL_PORT,
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+  });
+  await transporter.sendMail({
+    from: "CampusDating <noreply@campusdating.com>",
+    to: email,
+    subject: "Password Reset",
+    text: `Click here to reset: ${resetUrl}`
+  });
+
+  res.json({ message: "Reset link sent" });
+});
+
+app.post("/api/resetPassword", async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const hashed = await bcrypt.hash(password, 10);
+    await User.findByIdAndUpdate(decoded.id, { password: hashed });
+    res.json({ message: "Password reset successful" });
+  } catch (err) {
+    res.status(400).json({ error: "Invalid or expired token" });
+  }
+});
+
+// -------------------- SOCKET.IO CHAT --------------------
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+
+  socket.on("privateMessage", async ({ sender, receiver, text }) => {
+    const message = new Message({ sender, receiver, text });
+    await message.save();
+
+    io.emit(`chat-${receiver}`, message); // send to receiver
+  });
+
+  socket.on("disconnect", () => {
+    console.log("User disconnected:", socket.id);
+  });
+});
+
+// -------------------- START SERVER --------------------
+const PORT = process.env.PORT || 5000;
+httpServer.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
