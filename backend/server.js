@@ -1,91 +1,92 @@
 // backend/server.js
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const cors = require('cors');
+import express from 'express';
+import mongoose from 'mongoose';
+import cors from 'cors';
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Enable CORS for all origins
+// Enable CORS
 app.use(cors());
-
-// Middleware to parse JSON requests
 app.use(express.json());
 
-// Folder containing your JSON files
-const jsonFolder = __dirname;
+// Connect to MongoDB
+const mongoUri = process.env.MONGO_URL;
+if (!mongoUri) {
+  console.error('Error: MONGO_URL environment variable not set.');
+  process.exit(1);
+}
 
-// Helper functions
-const readJsonFile = (filePath) => {
-  if (fs.existsSync(filePath)) {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+mongoose.connect(mongoUri, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log('MongoDB connected!'))
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
+  });
+
+// Dynamic Mongoose model cache
+const models = {};
+
+// Helper function to get/create a model for a collection
+function getModel(collectionName) {
+  if (models[collectionName]) return models[collectionName];
+
+  const schema = new mongoose.Schema({}, { strict: false, timestamps: true });
+  const model = mongoose.model(collectionName, schema, collectionName);
+  models[collectionName] = model;
+  return model;
+}
+
+// Dynamic CRUD endpoints
+app.get('/api/:collection', async (req, res) => {
+  const { collection } = req.params;
+  const Model = getModel(collection);
+
+  try {
+    const data = await Model.find({});
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch data', details: err.message });
   }
-  return {};
-};
+});
 
-const writeJsonFile = (filePath, data) => {
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
-};
+app.post('/api/:collection', async (req, res) => {
+  const { collection } = req.params;
+  const Model = getModel(collection);
 
-// Merge objects (for updates)
-const mergeObjects = (target, source) => {
-  for (const key in source) {
-    if (source.hasOwnProperty(key)) {
-      target[key] = source[key];
+  try {
+    const doc = new Model(req.body);
+    await doc.save();
+    res.json({ message: 'Document saved successfully', data: doc });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to save document', details: err.message });
+  }
+});
+
+app.delete('/api/:collection', async (req, res) => {
+  const { collection } = req.params;
+  const Model = getModel(collection);
+  const { _id, filter } = req.body; // either _id or filter to delete multiple
+
+  try {
+    let result;
+    if (_id) {
+      result = await Model.findByIdAndDelete(_id);
+    } else if (filter) {
+      result = await Model.deleteMany(filter);
+    } else {
+      return res.status(400).json({ error: 'Provide either _id or filter to delete' });
     }
-  }
-  return target;
-};
-
-// Auto-generate CRUD endpoints for all JSON files
-fs.readdirSync(jsonFolder).forEach(file => {
-  if (path.extname(file) === '.json') {
-    const route = `/api/${path.basename(file, '.json')}`;
-    const filePath = path.join(jsonFolder, file);
-
-    // GET endpoint: read file
-    app.get(route, (req, res) => {
-      try {
-        const data = readJsonFile(filePath);
-        res.json(data);
-      } catch (err) {
-        res.status(500).json({ error: 'Failed to read file', details: err.message });
-      }
-    });
-
-    // POST endpoint: update/add keys
-    app.post(route, (req, res) => {
-      try {
-        const currentData = readJsonFile(filePath);
-        const updatedData = mergeObjects(currentData, req.body);
-        writeJsonFile(filePath, updatedData);
-        res.json({ message: `${file} updated successfully`, data: updatedData });
-      } catch (err) {
-        res.status(500).json({ error: 'Failed to update file', details: err.message });
-      }
-    });
-
-    // DELETE endpoint: remove keys
-    app.delete(route, (req, res) => {
-      try {
-        const currentData = readJsonFile(filePath);
-        const keysToDelete = req.body.keys || [];
-        keysToDelete.forEach(key => delete currentData[key]);
-        writeJsonFile(filePath, currentData);
-        res.json({ message: `${file} keys deleted successfully`, data: currentData });
-      } catch (err) {
-        res.status(500).json({ error: 'Failed to delete keys', details: err.message });
-      }
-    });
+    res.json({ message: 'Document(s) deleted successfully', result });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete document(s)', details: err.message });
   }
 });
 
 // Root route
 app.get('/', (req, res) => {
-  res.send('Campus Dating Backend is running!');
+  res.send('Campus Dating Backend with MongoDB is running!');
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
