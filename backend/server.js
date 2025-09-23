@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 10000;
 
 // ===== CORS =====
 app.use(cors({
-  origin: process.env.FRONTEND_URL,
+  origin: process.env.FRONTEND_URL || "*",
   credentials: true,
 }));
 
@@ -73,6 +73,11 @@ function authMiddleware(req, res, next) {
     next();
   } catch (e) { res.status(401).json({ error: "Invalid token" }); }
 }
+
+// ===== Health Check (CORS Test) =====
+app.get('/ping', (req, res) => {
+  res.json({ message: "✅ Server is alive and CORS is working!" });
+});
 
 // ===== Auth Routes =====
 app.post('/auth/register', upload.single('avatar'), async (req, res) => {
