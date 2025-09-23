@@ -1,0 +1,3 @@
+git add uploads/student2.jpg
+git commit -m "Add student2 image"
+git push origin main
