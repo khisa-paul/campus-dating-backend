@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 10000;
 
 // ===== CORS =====
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "*",
+  origin: process.env.FRONTEND_URL,  // ✅ your frontend (GitHub Pages or localhost)
   credentials: true,
 }));
 
@@ -40,7 +40,8 @@ const upload = multer({ storage });
 
 // ===== Models =====
 const userSchema = new mongoose.Schema({
-  username: { type: String, unique: true },
+  phone: { type: String, unique: true, required: true }, // ✅ phone number login
+  username: { type: String }, // optional display name
   password: String,
   avatar: String,
   privacy: { type: String, default: "everyone" }
@@ -48,8 +49,8 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 
 const messageSchema = new mongoose.Schema({
-  sender: String,
-  receiver: String,
+  sender: String,      // phone number of sender
+  receiver: String,    // phone number of receiver
   text: String,
   isGroup: Boolean,
   senderAvatar: String,
@@ -59,7 +60,7 @@ const Message = mongoose.model('Message', messageSchema);
 
 const groupSchema = new mongoose.Schema({
   name: String,
-  members: [String],
+  members: [String],   // store phone numbers
 });
 const Group = mongoose.model('Group', groupSchema);
 
@@ -69,49 +70,45 @@ function authMiddleware(req, res, next) {
   if (!token) return res.status(401).json({ error: "Unauthorized" });
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded.username;
+    req.user = decoded.phone; // ✅ phone instead of username
     next();
   } catch (e) { res.status(401).json({ error: "Invalid token" }); }
 }
 
-// ===== Health Check (CORS Test) =====
-app.get('/ping', (req, res) => {
-  res.json({ message: "✅ Server is alive and CORS is working!" });
-});
-
 // ===== Auth Routes =====
 app.post('/auth/register', upload.single('avatar'), async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Missing fields" });
+    const { phone, countryCode, password, username } = req.body;
+    if (!phone || !countryCode || !password) return res.status(400).json({ error: "Missing fields" });
 
+    const fullPhone = countryCode + phone; // ✅ e.g. +254712345678
     const hashed = await bcrypt.hash(password, 10);
     const avatarPath = req.file ? '/uploads/' + req.file.filename : null;
 
-    const user = new User({ username, password: hashed, avatar: avatarPath });
+    const user = new User({ phone: fullPhone, username, password: hashed, avatar: avatarPath });
     await user.save();
 
-    res.status(201).json({ message: "Registered successfully" });
+    res.status(201).json({ message: "Registered successfully", phone: fullPhone });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 app.post('/auth/login', async (req, res) => {
   try {
-    const { username, password } = req.body;
-    const user = await User.findOne({ username });
+    const { phone, password } = req.body;
+    const user = await User.findOne({ phone });
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(401).json({ error: "Invalid credentials" });
 
-    const token = jwt.sign({ username }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, username });
+    const token = jwt.sign({ phone }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, phone, username: user.username });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ===== Contacts =====
-app.get('/api/contacts/:username', authMiddleware, async (req, res) => {
-  const users = await User.find({ username: { $ne: req.params.username } });
+app.get('/api/contacts/:phone', authMiddleware, async (req, res) => {
+  const users = await User.find({ phone: { $ne: req.params.phone } });
   res.json(users);
 });
 
@@ -119,7 +116,7 @@ app.get('/api/contacts/:username', authMiddleware, async (req, res) => {
 app.post('/api/messages', authMiddleware, async (req, res) => {
   try {
     const msg = req.body;
-    const sender = await User.findOne({ username: msg.sender });
+    const sender = await User.findOne({ phone: msg.sender });
     if (sender) msg.senderAvatar = sender.avatar;
 
     const newMsg = new Message(msg);
@@ -129,29 +126,15 @@ app.post('/api/messages', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/message/:id/:username', authMiddleware, async (req, res) => {
+app.delete('/api/message/:id/:phone', authMiddleware, async (req, res) => {
   try {
     const msg = await Message.findById(req.params.id);
     if (!msg) return res.status(404).json({ error: "Message not found" });
-    if (msg.sender !== req.params.username) return res.status(403).json({ error: "Forbidden" });
+    if (msg.sender !== req.params.phone) return res.status(403).json({ error: "Forbidden" });
 
     await msg.deleteOne();
     res.json({ message: "Deleted" });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ===== Status =====
-app.post('/status', authMiddleware, upload.single('file'), async (req, res) => {
-  try {
-    const { text } = req.body;
-    const fileUrl = req.file ? '/uploads/' + req.file.filename : null;
-    res.json({ text, fileUrl });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/status/feed', authMiddleware, async (req, res) => {
-  const users = await User.find({});
-  res.json(users.map(u => ({ user: u.username, text: "", fileUrl: u.avatar })));
 });
 
 // ===== Groups =====
@@ -162,8 +145,8 @@ app.post('/api/groups/create', authMiddleware, async (req, res) => {
   res.json({ message: "Group created" });
 });
 
-app.get('/api/groups/:username', authMiddleware, async (req, res) => {
-  const groups = await Group.find({ members: req.params.username });
+app.get('/api/groups/:phone', authMiddleware, async (req, res) => {
+  const groups = await Group.find({ members: req.params.phone });
   res.json(groups);
 });
 
