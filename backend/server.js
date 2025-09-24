@@ -1,4 +1,4 @@
-// server.js (CommonJS)
+// server.js (All-in-one, WhatsApp-style backend)
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -10,8 +10,6 @@ const multer = require('multer');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
-const User = require('./models/User'); // model file (see below)
-
 const app = express();
 const server = http.createServer(app);
 const { Server } = require('socket.io');
@@ -19,11 +17,11 @@ const { Server } = require('socket.io');
 const PORT = process.env.PORT || 10000;
 const FRONTEND_URL = (process.env.FRONTEND_URL || '').trim();
 
-// ensure uploads folder exists
+// Ensure uploads folder exists
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// --- CORS ---
+// ----------------- CORS -----------------
 const allowedOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
@@ -34,7 +32,7 @@ if (FRONTEND_URL) allowedOrigins.push(FRONTEND_URL);
 
 app.use(cors({
   origin: function(origin, callback) {
-    if (!origin) return callback(null, true); // allow curl/postman/no-origin
+    if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
     return callback(new Error('CORS origin not allowed'));
   },
@@ -44,26 +42,34 @@ app.use(cors({
 app.use(express.json());
 app.use('/uploads', express.static(UPLOAD_DIR));
 
-// --- MongoDB connection ---
+// ----------------- MongoDB -----------------
 if (!process.env.MONGO_URI) {
-  console.error('❌ MONGO_URI is not defined in env');
+  console.error('❌ MONGO_URI is not defined in .env');
   process.exit(1);
 }
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-}).then(() => console.log('✅ Connected to MongoDB'))
+
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => { console.error('MongoDB connection error:', err); process.exit(1); });
 
-// --- Multer ---
+// ----------------- Multer -----------------
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname.replace(/\s/g, ''))
 });
 const upload = multer({ storage });
 
-// --- Other models defined inline: Message, Status, Group ---
+// ----------------- Models -----------------
 const { Schema } = mongoose;
+
+const userSchema = new Schema({
+  phone: { type: String, unique: true, required: true },
+  username: { type: String, unique: true, sparse: true },
+  password: String,
+  avatar: String,
+  createdAt: { type: Date, default: Date.now }
+});
+const User = mongoose.model('User', userSchema);
 
 const messageSchema = new Schema({
   sender: String,
@@ -91,7 +97,7 @@ const groupSchema = new Schema({
 });
 const Group = mongoose.model('Group', groupSchema);
 
-// --- JWT auth middleware ---
+// ----------------- JWT Middleware -----------------
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
   if (!header) return res.status(401).json({ error: 'Unauthorized' });
@@ -106,27 +112,20 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// ------------------ ROUTES ------------------
+// ----------------- Routes -----------------
 
-// sanity check
+// Sanity check
 app.get('/ping', (req, res) => res.json({ message: 'ok' }));
 
-// ---------- Auth: register & login ----------
+// --- Auth: register ---
 app.post('/auth/register', upload.single('avatar'), async (req, res) => {
   try {
-    // support phone + countryCode or full phone
-    // Accepts either: { phone } OR { countryCode, phone } OR { username, phone }
-    const body = req.body || {};
-    let { phone, countryCode, username, password } = body;
-
+    let { phone, countryCode, username, password } = req.body;
     if (countryCode && phone && !phone.startsWith('+')) phone = countryCode + phone;
-
     if (!phone || !password) return res.status(400).json({ error: 'phone and password required' });
 
-    // check duplicates
     const existing = await User.findOne({ $or: [{ phone }, { username }] });
     if (existing) {
-      // give helpful message whether phone or username exists
       if (existing.phone === phone) return res.status(400).json({ error: 'Phone already registered' });
       if (username && existing.username === username) return res.status(400).json({ error: 'Username already taken' });
       return res.status(400).json({ error: 'Already exists' });
@@ -141,11 +140,11 @@ app.post('/auth/register', upload.single('avatar'), async (req, res) => {
     return res.status(201).json({ message: 'Registered', phone: user.phone, username: user.username, avatar: user.avatar });
   } catch (err) {
     console.error('Register error:', err);
-    if (err.code === 11000) return res.status(400).json({ error: 'Duplicate key' });
     return res.status(500).json({ error: 'Register failed' });
   }
 });
 
+// --- Auth: login ---
 app.post('/auth/login', async (req, res) => {
   try {
     const { phone, username, password } = req.body;
@@ -157,7 +156,6 @@ app.post('/auth/login', async (req, res) => {
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(401).json({ error: 'Invalid credentials' });
 
-    // token payload contains phone and id
     const token = jwt.sign({ phone: user.phone, id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     return res.json({ token, phone: user.phone, username: user.username, avatar: user.avatar });
   } catch (err) {
@@ -166,29 +164,26 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// ---------- Contacts sync ----------
+// --- Contacts sync ---
 app.post('/api/contacts/sync', authMiddleware, async (req, res) => {
   try {
-    const { contacts } = req.body; // expect array of phone strings
+    const { contacts } = req.body;
     if (!Array.isArray(contacts)) return res.status(400).json({ error: 'contacts must be array' });
     const registered = await User.find({ phone: { $in: contacts } }, 'phone username avatar');
-    return res.json({ registered }); // array of user docs
+    return res.json({ registered });
   } catch (err) {
     console.error('Sync error', err);
     return res.status(500).json({ error: 'Sync failed' });
   }
 });
 
-// ---------- Messages ----------
+// --- Messages ---
 app.get('/api/messages/:user/:other', authMiddleware, async (req, res) => {
   try {
     const user = req.params.user;
     const other = decodeURIComponent(req.params.other);
     const messages = await Message.find({
-      $or: [
-        { sender: user, receiver: other },
-        { sender: other, receiver: user }
-      ]
+      $or: [{ sender: user, receiver: other }, { sender: other, receiver: user }]
     }).sort({ createdAt: 1 }).limit(1000);
     return res.json(messages);
   } catch (err) {
@@ -197,7 +192,6 @@ app.get('/api/messages/:user/:other', authMiddleware, async (req, res) => {
   }
 });
 
-// send message endpoint (supports optional file)
 app.post('/api/messages', authMiddleware, upload.single('file'), async (req, res) => {
   try {
     const { sender, receiver, text, isGroup } = req.body;
@@ -207,18 +201,14 @@ app.post('/api/messages', authMiddleware, upload.single('file'), async (req, res
     const senderUser = await User.findOne({ phone: sender });
     const senderAvatar = senderUser ? senderUser.avatar : null;
 
-    const msg = new Message({
-      sender, receiver, text, isGroup: isGroup === 'true' || isGroup === true, fileUrl, senderAvatar
-    });
+    const msg = new Message({ sender, receiver, text, isGroup: isGroup === 'true' || isGroup === true, fileUrl, senderAvatar });
     await msg.save();
 
-    // emit via socket.io
+    // emit via socket
     if (io) {
       if (msg.isGroup) {
         const g = await Group.findById(receiver);
-        if (g && g.members && g.members.length) {
-          g.members.forEach(m => io.to(m).emit('message', msg));
-        }
+        if (g && g.members && g.members.length) g.members.forEach(m => io.to(m).emit('message', msg));
       } else {
         io.to(receiver).emit('message', msg);
       }
@@ -232,23 +222,7 @@ app.post('/api/messages', authMiddleware, upload.single('file'), async (req, res
   }
 });
 
-app.delete('/api/message/:id/:phone', authMiddleware, async (req, res) => {
-  try {
-    const id = req.params.id;
-    const phone = req.params.phone;
-    const msg = await Message.findById(id);
-    if (!msg) return res.status(404).json({ error: 'Message not found' });
-    if (msg.sender !== phone) return res.status(403).json({ error: 'Forbidden' });
-    await msg.deleteOne();
-    if (io) io.to(msg.receiver).emit('message-deleted', { id });
-    return res.json({ message: 'Deleted' });
-  } catch (err) {
-    console.error('Delete message error', err);
-    return res.status(500).json({ error: 'Delete failed' });
-  }
-});
-
-// ---------- Status ----------
+// --- Status ---
 app.post('/status', authMiddleware, upload.single('file'), async (req, res) => {
   try {
     const text = req.body.text || '';
@@ -272,7 +246,7 @@ app.get('/status/feed', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- Groups ----------
+// --- Groups ---
 app.post('/api/groups/create', authMiddleware, async (req, res) => {
   try {
     const { name, members } = req.body;
@@ -296,7 +270,7 @@ app.get('/api/groups/:phone', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- Profile update ----------
+// --- Profile update ---
 app.put('/user/:phone/profile', authMiddleware, upload.single('avatar'), async (req, res) => {
   try {
     const phone = req.params.phone;
@@ -312,16 +286,9 @@ app.put('/user/:phone/profile', authMiddleware, upload.single('avatar'), async (
   }
 });
 
-// -------------------- Socket.IO --------------------
+// ----------------- Socket.IO -----------------
 const io = new Server(server, {
-  cors: {
-    origin: function(origin, callback){
-      if(!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      return callback(new Error('Not allowed by CORS'));
-    },
-    credentials: true
-  }
+  cors: { origin: allowedOrigins, credentials: true }
 });
 
 io.use((socket, next) => {
@@ -338,9 +305,9 @@ io.use((socket, next) => {
 });
 
 io.on('connection', socket => {
-  console.log('socket connected', socket.phone);
-  socket.on('disconnect', () => console.log('socket disconnected', socket.phone));
-  // optional send via socket
+  console.log('Socket connected', socket.phone);
+  socket.on('disconnect', () => console.log('Socket disconnected', socket.phone));
+
   socket.on('send-message', async (data) => {
     try {
       const { sender, receiver, text, isGroup } = data;
@@ -353,9 +320,9 @@ io.on('connection', socket => {
         io.to(receiver).emit('message', msg);
       }
       io.to(sender).emit('message', msg);
-    } catch (e) { console.error('socket send error', e); }
+    } catch (e) { console.error('Socket send error', e); }
   });
 });
 
-// -------------------- Start --------------------
+// ----------------- Start Server -----------------
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
